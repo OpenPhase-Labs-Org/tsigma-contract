@@ -95,14 +95,20 @@ RPCs themselves.
 
 ## Status
 
-**DRAFT - under review.** The governance, the frozen base protocol, the wire-type
-conventions, all **six wire subsystem contracts** (`decoder`, `method`, `report`,
-`notify`, `auth`, `storage`), and the **18 contract ADRs** ([`adr/`](adr/)) are
-authored. Open items are flagged in-file: the privileged-tier enforcement
-mechanism (ADR-0016), the auth login-flow transport's final shape (ADR-0017,
-leaning shape a), and codegen tooling (`buf` vs raw `protoc`, lockfiles, CI
-publish). Nothing is pinned to a release; the whole artifact is draft pending
-review.
+**DRAFT.** The governance, the frozen base protocol, the wire-type conventions,
+all **six wire subsystem contracts** (`decoder`, `method`, `report`, `notify`,
+`auth`, `storage`), and the **19 contract ADRs** ([`adr/`](adr/)) are authored,
+and the `.proto` set builds and lints clean (ADR-0019).
+
+It stays draft until a TSIGMA host implements it. A contract is proven by a host
+built against it, not by the completeness of its own documents - so the version
+is not pinned to a release yet, and while it is draft a deliberate breaking
+change is still legitimate. The checks above exist to make breakage
+**intentional**, not impossible.
+
+Open items are flagged in-file: the privileged-tier enforcement mechanism
+(ADR-0016), the auth login-flow transport's final shape (ADR-0017, leaning shape
+a), and release mechanics - publishing, tagging, CI (ADR-0019).
 
 ## License
 

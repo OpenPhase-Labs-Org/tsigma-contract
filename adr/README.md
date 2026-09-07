@@ -59,6 +59,7 @@ describes the pre-amendment surface is a defect, not history.
 | [0016](0016-privileged-tier-enforcement.md) | Privileged-tier enforcement mechanism | Open | - |
 | [0017](0017-auth-login-flow-transport.md) | Auth login-flow transport over the gRPC wire (HTTP-over-gRPC) | Proposed (leaning shape a) | - |
 | [0018](0018-report-view-model-richness.md) | Report view-model richness (minimal vs structured) | Accepted (provisional minimal) | - |
+| [0019](0019-buf-as-verification-toolchain.md) | `buf` is the contract's verification toolchain; codegen stays with the consumer | Accepted | - |
 
 ## Self-containment
 

@@ -54,8 +54,9 @@ vigilance.
 - The artifact must be **self-contained**: a normative rule belongs in the
   contract (PROTOCOL.md / TYPES.md / the `.proto` files), not in a host's private
   docs. Implementers read only this repo.
-- Codegen tooling (buf vs raw protoc, lockfiles, CI publish) is a follow-up
-  decision, intentionally not pinned at draft time.
+- Verification tooling, and the decision not to centralize codegen here, are
+  settled in [0019](0019-buf-as-verification-toolchain.md). Release mechanics
+  (publishing, tagging, CI) remain open.
 - Related: [0002](0002-freeze-wire-protocol.md) (the wire protocol this contract
   freezes), [0003](0003-per-subsystem-contract-set.md) (how the contract is
   partitioned).
