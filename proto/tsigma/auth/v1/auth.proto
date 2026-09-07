@@ -1,0 +1,396 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Auth subsystem.
+//
+// Trust posture: PRIVILEGED - first-party or DOT-sanctioned ONLY. Auth is a
+// trust ROOT: the provider ASSERTS IDENTITY (it decides who a request is). The
+// broker-mediation that contains an untrusted decoder/method/report (crash
+// isolation + no credentials + tenant-scoped data) CANNOT contain a trust root,
+// because a malicious auth provider would simply assert "this caller is admin."
+// Therefore a binary must not be allowed to register as `auth` unless it clears
+// an explicit host-side operator authorization keyed to the auth subsystem.
+//   THE GATE MECHANISM IS NOT DESIGNED HERE. PROTOCOL.md section 6 flags the
+//   privileged-tier enforcement mechanism as an OPEN deliberation (signed
+//   plugins vs operator allowlist vs per-binary approval, complicated by who
+//   operates the deployment). This file defines the CONTRACT SHAPE only; the
+//   enforcement policy is out of scope and stays flagged there.
+//
+// IMPORTANT SHAPE (do NOT mistake this for a token-validation RPC). The auth
+// provider is NOT called per-request with a credential to return a principal.
+// It OWNS the browser-facing login flow and serves its own HTTP login routes,
+// which the host mounts under /api/v1/auth/. The flow is provider-shaped:
+//   - local:  POST /login           (username/password verify)
+//   - oidc:   GET  /oidc/login      (build IdP authorize URL)
+//             GET  /oidc/callback   (state check -> token exchange -> userinfo)
+//   - oauth2: analogous login/callback
+// That ownership is what makes a provider replaceable: a new login flow can be
+// installed without the host learning its steps.
+//
+// On a successful login the provider calls back into HOST-CORE services to
+// (1) create the server-side session, (2) provision the user, and (3) write the
+// auth-audit row. Those three are CORE, never owned by the plugin:
+//   - the SESSION LAYER is CORE (cookie issuance, per-request validation, the
+//     session store); a provider plugin never holds the session store, because
+//     holding it would let the provider mint sessions the host never authorized.
+//   - user provisioning writes the identity store, where the host's role policy
+//     applies.
+//   - auth-audit writes the audit record, which must not be forgeable by the
+//     component being audited.
+// A provider therefore consumes more than an untrusted plugin does - but only
+// these host-mediated calls, never DB credentials or schema (PROTOCOL.md s4).
+//
+// HOW THIS MAPS TO A WIRE PLUGIN (the ambiguity). The frozen wire protocol is
+// gRPC, but the provider boundary is an HTTP handler, not a gRPC service.
+// Carrying that handler across the gRPC plugin boundary is a genuine open
+// modeling decision; it is flagged with [DESIGN-CHECK: HTTP-OVER-GRPC] below
+// and several handler-transport shapes are sketched, NOT chosen. This file is
+// deliberately conservative: it models the parts that are unambiguous
+// (Describe, Initialize, the host-core consume-side callbacks, and the
+// principal/claims/identity shapes) and flags the login-route transport rather
+// than inventing a token-authenticate RPC this subsystem does not have.
+//
+// Wire types (see TYPES.md): all auth payloads are structured/small -> protobuf.
+// No bulk/tabular data crosses this boundary, so there are no Arrow streams here.
+
+syntax = "proto3";
+
+package tsigma.auth.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/auth/v1;authv1";
+
+// ===========================================================================
+// IMPLEMENT-SIDE: host -> plugin. The host calls these on the provider.
+// ===========================================================================
+
+// AuthProviderService is implemented by an auth-provider plugin and called by the host.
+//
+// Only ONE provider is active at a time, selected by host configuration
+// (local, oidc, oauth2, or a customer IdP). Provider selection and the session
+// layer are HOST concerns, not part of this contract.
+service AuthProviderService {
+  // Describe returns the provider's static identity: its registry key and a
+  // human-readable description. The host uses it at registration and to report
+  // which auth mode is active.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Initialize is called once during host startup, BEFORE any login route is
+  // served. Use it to fetch OIDC discovery documents, validate provider config,
+  // and so on. A provider that cannot initialize fails here and the host
+  // refuses to bring it up - an auth provider that is half-configured must not
+  // serve a login route. Carries no secrets in or out; the provider reads its
+  // own config (see [DESIGN-CHECK: PROVIDER-CONFIG]).
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+
+  // WORKING DIRECTION (provisional, NOT final): leaning shape (a), the generic
+  // HTTP tunnel (HandleHttp below). This may
+  // change during development; shapes (b)/(c) are retained as alternatives. Under
+  // the leaning shape (a) the consume-side broker callbacks (Session/Provision/
+  // Audit) ARE needed (resolves [DESIGN-CHECK: BROKER-NEED] for now), and the
+  // provider's POST /login validates CSRF via the host ([DESIGN-CHECK:
+  // CSRF-OWNERSHIP] leans "provider validates"). None of this is set in stone.
+  //
+  // [DESIGN-CHECK: HTTP-OVER-GRPC] (still open at the margin) The login flow.
+  //
+  // The provider serves HTTP login routes: local POST /login; oidc
+  // GET /oidc/login + GET /oidc/callback; oauth2 analogous. Mounted by the host
+  // under /api/v1/auth/. Mapping this HTTP
+  // handler onto the frozen gRPC wire protocol is an OPEN decision. Candidate
+  // shapes (NONE chosen here):
+  //
+  //   (a) Generic HTTP-tunnel RPC: a single
+  //         rpc HandleHttp(HandleHttpRequest) returns (HandleHttpResponse);
+  //       where the host forwards the raw browser request (method, path,
+  //       headers, query, body) and the provider returns status/headers/body.
+  //       Faithful to "provider owns its routes" but pushes opaque HTTP over
+  //       gRPC and needs streaming for large bodies (none expected for auth).
+  //
+  //   (b) Semantic per-step RPCs that hoist the flow OUT of HTTP, e.g.
+  //         rpc BeginLogin(BeginLoginRequest) returns (BeginLoginResponse);
+  //         rpc CompleteLogin(CompleteLoginRequest) returns (LoginResult);
+  //       host keeps the HTTP routes in core and calls the provider for the
+  //       provider-specific steps (verify password / build authorize URL /
+  //       exchange code+state -> claims). Cleaner contract, but it relocates
+  //       route ownership from the plugin to the host, which changes the
+  //       boundary rather than choosing a transport for it, and would require
+  //       the host to model every provider's flow. Not adopted.
+  //
+  //   (c) Provider listens on its own host:port (handshake ADDRESS) and the
+  //       host reverse-proxies /api/v1/auth/ to it. Closest to a native HTTP
+  //       handler shape but partly steps outside the gRPC-only wire model.
+  //
+  // Shapes (b)/(c) are retained at the bottom of this file under
+  // "ALTERNATIVES: login-flow transport" as flagged drafts.
+  //
+  // HandleHttp carries the login flow under the provisional shape (a). The host
+  // forwards the raw browser request (method/path/query/headers/body) for any
+  // route under /api/v1/auth/ and the provider returns status/headers/body plus
+  // the resolved Principal on success (the host still mints the session via
+  // SessionService and owns Set-Cookie). PROVISIONAL (leaning a; not final).
+  rpc HandleHttp(HandleHttpRequest) returns (HandleHttpResponse);
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // Provider registry key, e.g. "local" | "oidc" | "oauth2" | a customer IdP
+  // name.
+  string name = 1;
+
+  // Human-readable description, e.g. "Local username/password authentication".
+  string description = 2;
+
+  // [DESIGN-CHECK: ROUTE-PREFIXES] The host mounts provider routes under
+  // /api/v1/auth/, but the route SUFFIXES differ per provider (local exposes
+  // /login; oidc exposes /oidc/login + /oidc/callback). Open: whether the
+  // provider must declare its paths to the host up front, or whether the host
+  // forwards everything under the prefix without knowing them. This depends on
+  // the HTTP-over-gRPC shape chosen above: a tunnel needs no declaration, while
+  // a host that routes needs one. Left as a flagged field, NOT assumed into the
+  // contract:
+  //   repeated string route_paths = 3;
+}
+
+message InitializeRequest {}
+
+message InitializeResponse {
+  // Empty on success. Initialize failure is surfaced as a gRPC error status
+  // rather than an ok/reason pair, so a provider that cannot come up fails
+  // loudly with a status the host cannot mistake for a successful start.
+}
+
+// ===========================================================================
+// PRINCIPAL / IDENTITY / CLAIMS  (structured protobuf messages)
+// ===========================================================================
+
+// Role is the RBAC role: a closed two-role model.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ADMIN = 1;
+  ROLE_VIEWER = 2;
+}
+
+// Principal is the authenticated identity the host carries for a request: the
+// post-auth identity used for every downstream access decision. The SESSION
+// (cookie + store) is CORE; Principal is the data a successful login hands to
+// the host so the host can mint that session.
+message Principal {
+  // Canonical UUID text. Empty only for pre-session contexts that have no
+  // resolved user yet.
+  string user_id = 1;
+
+  // Unique username for the resolved identity.
+  string username = 2;
+
+  // Modeled as an enum rather than a string so an unrecognized or misspelled
+  // role cannot cross the wire and be silently interpreted; any string
+  // round-trip belongs on the host side of the boundary.
+  Role role = 3;
+
+  // Genuinely-optional instants, relying on Timestamp message-presence: unset
+  // means not yet stamped. For a freshly-authenticated principal these are
+  // unset, because the host session layer - not the provider - decides session
+  // lifetime and stamps them when it creates the session.
+  google.protobuf.Timestamp created_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+// ExternalClaims is the identity asserted by an EXTERNAL IdP (OIDC/OAuth2)
+// before the host provisions a local user. This is the "claims" shape - what
+// the IdP told us - deliberately distinct from the resolved local Principal
+// above, which is what the HOST decided.
+message ExternalClaims {
+  // IdP subject identifier (OIDC `sub`) - the stable external id. Stable across
+  // renames, which is why it, not the username, is the join key.
+  string external_id = 1;
+
+  // Provider name that asserted these claims: "oidc" | "oauth2" | customer IdP.
+  string external_provider = 2;
+
+  // Username derived from claims; an OIDC provider typically uses email or
+  // preferred_username.
+  string username = 3;
+
+  // Role as resolved from IdP group membership by the provider. This is a
+  // PROPOSAL, not a decision: the host applies its own role policy - including
+  // never downgrading an existing user - in the provisioning callback. A
+  // provider cannot promote itself by asserting ADMIN here.
+  Role role = 4;
+
+  // [DESIGN-CHECK: RAW-CLAIMS] A provider typically reads richer userinfo
+  // (groups, name, email) before reducing to the four fields above. Open:
+  // whether a structured carrier for pass-through claims belongs here, to let
+  // the host do its own role mapping from the original claims rather than
+  // trusting the provider's reduction. Not added now - flagged only. If it is
+  // ever added, NEVER place tokens or secrets in it: no access tokens cross
+  // this contract.
+}
+
+// ===========================================================================
+// CONSUME-SIDE broker callbacks: plugin -> HOST-served services (over the same
+// go-plugin GRPCBroker connection; see PROTOCOL.md section 4). A privileged
+// provider legitimately calls back into these CORE services on a successful
+// login. This grants exactly three capabilities and no more.
+//
+// NOTE: whether these are needed AT ALL depends on the HTTP-over-grpc shape
+// chosen above. Under shape (b) the host runs the login route and performs
+// session/provision/audit itself, so the provider may need NONE of these. Under
+// shapes (a)/(c) the provider drives the flow and needs them. They are defined
+// here because provider-owned routes require them; flagged
+// [DESIGN-CHECK: BROKER-NEED] accordingly.
+// ===========================================================================
+
+// SessionService is HOST-CORE. The provider
+// calls CreateSession after a successful login to mint the server-side session;
+// the host owns cookie issuance and the store. This is the single most
+// security-sensitive callback: the host - not the plugin - decides session TTL,
+// id entropy, and cookie attributes. The provider supplies only the resolved
+// identity (user_id/username/role) it just authenticated.
+//
+// CSRF nonce issuance and validation belong to the same core session store;
+// whether the provider needs to reach them depends on the login-transport shape
+// and is flagged below.
+service SessionService {
+  // CreateSession mints a server-side session for an authenticated identity and
+  // returns the session id, which the host puts in the httponly cookie.
+  rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+
+  // [DESIGN-CHECK: CSRF-OWNERSHIP] the session store also issues and validates
+  // a one-time CSRF nonce used by the local login form. Under HTTP-over-grpc
+  // shape (b) the host owns CSRF entirely and the provider needs neither RPC.
+  // Under shape (a)/(c) the provider serves POST /login and must validate the
+  // nonce itself, so it would need ValidateCsrf here. Left as a flagged pair,
+  // NOT added until the login-transport shape is decided:
+  //   rpc CreateCsrf(CreateCsrfRequest) returns (CreateCsrfResponse);
+  //   rpc ValidateCsrf(ValidateCsrfRequest) returns (ValidateCsrfResponse);
+}
+
+message CreateSessionRequest {
+  // The authenticated identity to create a session for. Only user_id, username
+  // and role are inputs; created_at/expires_at are stamped by the host session
+  // layer and are IGNORED if set here, so a provider cannot choose its own
+  // session lifetime.
+  Principal principal = 1;
+}
+
+message CreateSessionResponse {
+  // Opaque session id. The host sets this as the httponly cookie value; the
+  // provider treats it as opaque and MUST NOT log it.
+  string session_id = 1;
+}
+
+// ProvisioningService is HOST-CORE. External providers (OIDC/OAuth2) call
+// ProvisionUser on each login to upsert the local user from IdP claims,
+// returning the resolved local Principal with the host's role policy - including
+// "never downgrade" - applied. The provider passes claims; the host writes the
+// identity store and owns the role policy, so a provider cannot grant a role the
+// operator's policy would not.
+service ProvisioningService {
+  // ProvisionUser upserts a local user from external claims and returns the
+  // resolved local identity.
+  rpc ProvisionUser(ProvisionUserRequest) returns (ProvisionUserResponse);
+}
+
+message ProvisionUserRequest {
+  // Claims asserted by the external IdP (post token-exchange + userinfo).
+  ExternalClaims claims = 1;
+}
+
+message ProvisionUserResponse {
+  // The resolved LOCAL identity after upsert and host role policy. This
+  // Principal - not the claims the provider asserted - is what is then handed
+  // to SessionService.CreateSession.
+  Principal principal = 1;
+}
+
+// AuditService is HOST-CORE. The provider records authentication events
+// (login, login_failed, lockout; logout is host-route-driven). The host owns the
+// audit record; the provider supplies the event facts. Auditing is a trust
+// requirement for a trust root - it is why the provider must report FAILURES,
+// not just successes: an auth provider that logged only its successes would
+// hide exactly the pattern an audit exists to catch.
+service AuditService {
+  // LogAuthEvent appends one authentication-audit row.
+  rpc LogAuthEvent(LogAuthEventRequest) returns (LogAuthEventResponse);
+}
+
+// AuthEventType enumerates the recorded auth events.
+enum AuthEventType {
+  AUTH_EVENT_TYPE_UNSPECIFIED = 0;
+  AUTH_EVENT_TYPE_LOGIN = 1;          // successful authentication
+  AUTH_EVENT_TYPE_LOGIN_FAILED = 2;   // invalid credentials / inactive user
+  AUTH_EVENT_TYPE_LOCKOUT = 3;        // too many failed attempts (5 in 5 min)
+  AUTH_EVENT_TYPE_LOGOUT = 4;         // user-initiated session termination
+}
+
+message LogAuthEventRequest {
+  AuthEventType event_type = 1;
+
+  // Username involved, recorded even for failed attempts (the attempted
+  // username is logged on login_failed/lockout).
+  string username = 2;
+
+  // Resolved user id, ABSENT for failures where no user resolved - an attempt
+  // against a username that does not exist still gets an audit row. Empty
+  // string = absent.
+  string user_id = 3;
+
+  // Client request context for the audit row: IP and user-agent. Carried
+  // explicitly because the plugin has no access to the host's request object.
+  // NO Authorization header or token is included.
+  string ip_address = 4;
+  string user_agent = 5;
+}
+
+message LogAuthEventResponse {
+  // Empty on success; failure surfaces as a gRPC error status.
+}
+
+// ===========================================================================
+// PROVISIONAL shape (a): generic HTTP tunnel (login flow). Active, leaning (a),
+// NOT final. The provider keeps owning its
+// routes; the host forwards the raw browser request and returns the provider's
+// response, minting the session itself via SessionService. NOT settled - shapes
+// (b)/(c) below remain alternatives until the login-transport decision is final.
+// ===========================================================================
+
+message HandleHttpRequest {
+  string method = 1;                 // "GET" | "POST"
+  string path = 2;                   // e.g. "/login", "/oidc/callback"
+  map<string, string> query = 3;     // e.g. code, state
+  map<string, string> headers = 4;   // sanitized; never forwarded to logs
+  bytes body = 5;                    // login JSON; small, no streaming needed
+}
+
+message HandleHttpResponse {
+  int32 status_code = 1;             // 200 / 401 / 403 / 429 ...
+  map<string, string> headers = 2;   // e.g. Location for oidc redirect
+  bytes body = 3;
+  // The host still owns Set-Cookie / session minting via SessionService; the
+  // provider returns the resolved Principal out-of-band, NOT a cookie. Set on
+  // successful login, else unset.
+  Principal principal = 4;
+}
+
+// ===========================================================================
+// ALTERNATIVES: login-flow transport (DRAFT, NOT active). Retained so the shape
+// decision can be revisited. Do not codegen-depend on these.
+// ===========================================================================
+
+// --- Shape (b): semantic per-step RPCs (host owns routes; relocates ownership
+//     away from the plugin - a boundary change, not a transport choice;
+//     not adopted) ---
+// message BeginLoginRequest  { map<string, string> params = 1; }  // e.g. none / authorize inputs
+// message BeginLoginResponse { string redirect_url = 1; }         // oidc authorize URL; empty for local
+// message CompleteLoginRequest {
+//   // local: username + password (+ csrf handled host-side);
+//   // oidc/oauth2: code + state.
+//   map<string, string> params = 1;
+// }
+// message LoginResult {
+//   bool authenticated = 1;
+//   Principal principal = 2;       // set when authenticated
+//   ExternalClaims claims = 3;     // set for external providers pre-provision
+// }

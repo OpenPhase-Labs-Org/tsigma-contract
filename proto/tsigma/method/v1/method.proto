@@ -1,0 +1,539 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Method subsystem (ingestion methods: pollers and listeners).
+//
+// Trust posture: UNTRUSTED-VENDOR-OK. An ingestion method does TRANSPORT/FETCH
+// only - it pulls bytes from a controller (FTP/SFTP/HTTP poll) or receives bytes
+// pushed by a device (UDP/TCP/gRPC/MQTT/NATS listen, or a watched directory). It
+// is crash-isolated, receives NO database credentials and NO schema, and is
+// contained by the host-mediated broker data plane below (PROTOCOL.md section 4).
+// A method NEVER decodes and NEVER validates: the host owns the pipeline
+// (fetch -> decode -> validate -> persist) and the poison-aware integrity spine,
+// which is CORE and carries no contract (PROTOCOL.md section 6, README
+// "Validation is core"). The method hands RAW payloads (and, for fetch-time file
+// identity, small structured metadata) back to the host; it does not merge in a
+// decode-and-persist path. A single vendor binary MAY also register the decoder
+// contract (go-plugin plugin set: one binary, multiple registrations) - the
+// contracts STAY SEPARATE and the host still orchestrates; it is never a merged
+// poll-and-decode.
+//
+// IMPLEMENT-SIDE (host -> plugin): the Method service, covering three execution
+// modes:
+//   - POLLING: the host SCHEDULES the plugin; one Poll call per device per
+//     interval.
+//   - LISTENER: a LONG-LIVED push receiver (UDP/TCP/gRPC/MQTT/NATS) the host
+//     starts once at boot and stops on shutdown.
+//   - EVENT_DRIVEN: a long-lived directory watcher; the same long-lived
+//     start/stop lifecycle as a listener, distinguished only by mode.
+// Poller vs listener is preserved as two RPCs with different lifecycle shapes:
+// Poll is one request/one terminal response (scheduled, one-shot); Listen is a
+// long-lived server-stream of lifecycle/health signals the host keeps open for
+// the life of the receiver and cancels (ctx cancel) to Stop.
+//
+// CONSUME-SIDE (plugin -> host) BROKER DATA PLANE: a method is untrusted and gets
+// no DB handle, so everything DB-touching is a CALL BACK to a HOST-SERVED broker
+// service over the same go-plugin connection (PROTOCOL.md section 4). The host
+// answers from its own session, under the request's TENANT CONTEXT. Each service
+// takes typed keys or typed facts, never a query the plugin composed. Defined
+// below:
+//   - CheckpointService   (load / save / record-error)
+//   - EventSinkService           (RAW bytes in; the host decodes, validates, persists)
+//   - DecoderResolverService     (resolve by name / by extension)
+//   - ConfigService       (device list + per-device config)
+//
+// WIRE TYPES (see TYPES.md, PROTOCOL.md "Message size invariant"): no message
+// approaches the gRPC cap and the cap is never raised.
+//   - RAW fetched/received payloads (controller file bytes, datagrams) the method
+//     hands the host -> bounded BYTE CHUNK streams (a controller .dat can exceed
+//     the cap; a TCP payload is bounded but chunked uniformly).
+//   - DECODED events do NOT cross the method boundary. A method never decodes
+//     (raw-bytes-only). It ships RAW bytes via
+//     EventSinkService.DecodeAndPersist; the host decodes/validates/persists them
+//     through its CORE integrity spine, and the resulting Arrow event batches
+//     are host-internal - never supplied by, or returned to, the method.
+//   - structured/small payloads (Describe, config, checkpoint, identity refs,
+//     lifecycle/health) -> protobuf.
+//
+// Per-subsystem versioning: v1, independently versioned from the other subsystems
+// (PROTOCOL.md section 5). Self-contained; depends only on well-known protobuf
+// types.
+
+syntax = "proto3";
+
+package tsigma.method.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/method/v1;methodv1";
+
+// ===========================================================================
+// IMPLEMENT-SIDE (host -> plugin)
+// ===========================================================================
+
+// MethodService is implemented by an ingestion-method plugin and called by the host.
+// All RPCs here are host -> plugin. A method ALSO dials back into the host-served
+// broker services in the CONSUME-SIDE section below; those are the host's
+// services, not this one's.
+service MethodService {
+  // Describe returns the method's identity and static execution mode, so the
+  // host can route it to the right orchestrator - scheduled for POLLING,
+  // long-lived for LISTENER / EVENT_DRIVEN - at load time. The mode is a static
+  // property of the method, not a per-call parameter.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // HealthCheck reports method DOMAIN READINESS, distinct from the envelope
+  // grpc.health.v1.Health (PROTOCOL.md section 2): the envelope check is process
+  // LIVENESS (is the plugin up and serving); this is whether the method's WORK is
+  // healthy. For POLLING methods this is "always healthy" by design (per-device
+  // connectivity is proven during a poll); for LISTENER / EVENT_DRIVEN it
+  // reflects whether the bound socket / broker subscription / watcher is live.
+  // A listener whose socket died is a process that is still alive and still
+  // ingesting nothing, which envelope liveness alone would report as healthy.
+  // The host aggregates these results into its own collection-health surface.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Poll executes ONE poll cycle for a SINGLE device (POLLING methods only).
+  // The host calls it on the device's schedule, or on demand. One request ->
+  // one terminal PollResponse; the method does its transport/fetch and drives
+  // the host's broker services (checkpoint load/save, decoder resolve, persist)
+  // to complete the cycle. RAW fetched bytes are handed to the host via the
+  // EventSinkService.DecodeAndPersist broker path; the host decodes, and the method
+  // does not.
+  rpc Poll(PollRequest) returns (PollResponse);
+
+  // Listen runs a LONG-LIVED push receiver (LISTENER) or directory watcher
+  // (EVENT_DRIVEN). The host calls it ONCE at boot for the matched device set;
+  // the plugin opens its socket / broker subscription / watcher and serves until
+  // the host CANCELS the RPC (context cancellation) to Stop - a start/stop
+  // lifecycle expressed as one cancelable streaming RPC. The server-stream
+  // carries lifecycle/health signals (started, per-device bind results,
+  // reconnect notices) so the host observes the receiver without a separate
+  // poll. Inbound device payloads are NOT returned on this stream; the plugin
+  // pushes each received payload into the host via the EventSinkService broker path as
+  // it arrives.
+  //
+  // [DESIGN-CHECK: Listen lifecycle framing. Expressing start/stop as a single
+  // cancelable server-stream is a transport recast: cancellation is the only
+  // stop signal, and there is no handle to address a running instance by. Open:
+  // (a) is a cancelable server-stream the intended Stop mechanism, or should
+  // Stop be an explicit RPC keyed by an instance id - which a host would need in
+  // order to stop ONE receiver without tearing down the RPC; (b) should
+  // lifecycle and health flow back on this stream at all, or be left to logs and
+  // notifications. Do not pick - this affects whether ListenResponse exists.]
+  rpc Listen(ListenRequest) returns (stream ListenResponse);
+}
+
+// ExecutionMode is the method's static execution shape. The host uses it
+// at registration to route the plugin to the correct orchestrator and to pick
+// Poll vs Listen.
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  EXECUTION_MODE_POLLING = 1;       // scheduled one-shot fetch; use Poll
+  EXECUTION_MODE_LISTENER = 2;      // long-lived push receiver; use Listen
+  EXECUTION_MODE_EVENT_DRIVEN = 3;  // long-lived directory watcher; use Listen
+}
+
+// DeviceType is the host's ingestion target scope for a device: CONTROLLER and
+// SENSOR events land in different canonical schemas. UNSPECIFIED defaults to
+// CONTROLLER, so a method that predates the sensor scope keeps working.
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;  // defaults to CONTROLLER
+  DEVICE_TYPE_CONTROLLER = 1;
+  DEVICE_TYPE_SENSOR = 2;
+}
+
+// IngestOutcome is the host's verdict on one DecodeAndPersist call, and the
+// input to the host's checkpoint-advancement policy. Deliberately NOT
+// decoder.v1's DecodeOutcome: no subsystem proto imports another, so decoder/v2
+// must not be able to break method/v1 (ADR-0004).
+enum IngestOutcome {
+  INGEST_OUTCOME_UNSPECIFIED = 0;
+  INGEST_OUTCOME_SUCCESS = 1;  // fully decoded and persisted; advance the checkpoint
+  INGEST_OUTCOME_PARTIAL = 2;  // some rows persisted, remainder flagged; advance only
+                               // to max_event_time, re-attempt the tail next cycle
+  INGEST_OUTCOME_FAILURE = 3;  // nothing persisted; do NOT advance, record_error, alert
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;                  // registry key, e.g. "ftp_pull", "tcp_server"
+  ExecutionMode execution_mode = 2;
+  string description = 3;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  // Optional human-readable detail (e.g. "udp socket open", "broker
+  // disconnected"); empty when healthy. Not used for control flow.
+  string detail = 2;
+}
+
+// ---- Poll (POLLING) --------------------------------------------------------
+
+// PollRequest is the host's one-shot poll command for a single device. The host
+// supplies the device id and that device's per-device collection config, with
+// credentials ALREADY DECRYPTED host-side - the plugin never decrypts and never
+// sees the encryption key. Tenant scoping is carried by the broker connection
+// context, not duplicated here.
+message PollRequest {
+  // Device identifier, in the host's own identifier space for the device_type.
+  string device_id = 1;
+
+  // Per-device collection config, handed over already resolved and already
+  // decrypted. Struct preserves the JSON types of the original config block
+  // (port:int, use_tls:bool, file_extensions:list) rather than flattening
+  // everything to strings the method would have to re-parse; the method reads it
+  // into its own typed config and validates fail-fast. Struct is the
+  // contract-wide standard wire shape for an arbitrary JSON config block (as in
+  // report params).
+  google.protobuf.Struct config = 2;
+
+  // device_type selects the host's ingestion target scope (see DeviceType).
+  DeviceType device_type = 3;
+}
+
+// PollResponse is the single terminal result of one poll cycle. It carries only
+// a coarse outcome for the host's scheduler and observability - NOT the events,
+// which went to the host via the EventSinkService broker path during the cycle, and not
+// the integrity record, which the broker calls already wrote.
+message PollResponse {
+  // True when the cycle completed without an unhandled transport error. A
+  // per-cycle transport failure is ALSO reported through the broker
+  // CheckpointService.RecordError call (which is what advances backoff); this
+  // flag is the scheduler-facing summary, not the integrity record.
+  bool ok = 1;
+  // Optional human-readable error summary when ok=false. Empty when ok=true.
+  string error = 2;
+
+  // [DESIGN-CHECK: PollResponse contents. Counters here (events_ingested,
+  // files_ingested, duplicates_absorbed) would duplicate what SaveCheckpoint
+  // already persisted, and two records of the same cycle can disagree. This
+  // message therefore carries only ok/error. Open: whether the host's scheduler
+  // needs anything further from Poll's direct return that it cannot read back
+  // from the checkpoint it just wrote.]
+}
+
+// ---- Listen (LISTENER / EVENT_DRIVEN) --------------------------------------
+
+// ListenRequest starts a long-lived receiver/watcher for a PRE-FILTERED device
+// set. The host supplies the server-level config (bind host/port, broker URL,
+// credentials, instance discriminator, watch paths), which is process-scoped
+// rather than per-device, plus the matched DevicePair list for per-device
+// routing. The host has already applied its enable gate and skipped this method
+// entirely if zero devices matched, so `devices` is always non-empty here.
+message ListenRequest {
+  // Server-level connection config (broker URL, bind, credentials, instance).
+  // Process-scoped, not per-device. Struct preserves JSON types, as in
+  // PollRequest.config.
+  google.protobuf.Struct config = 1;
+
+  // device_type for the target scope (see DeviceType). A listener container may
+  // be started once per source (controller / sensor); each Listen call carries
+  // the device_type of the source it serves.
+  DeviceType device_type = 2;
+
+  // The matched (device_id, per-device-config) pairs this receiver instance
+  // handles, pre-filtered by method and instance host-side. The plugin builds
+  // its routing table from these: source-IP map (TCP/UDP), topic/subject
+  // subscriptions (MQTT/NATS), client-id set (gRPC), filename routing (directory
+  // watch).
+  repeated DevicePair devices = 3;
+}
+
+// DevicePair is one (device_id, per-device collection config) entry.
+message DevicePair {
+  string device_id = 1;
+  google.protobuf.Struct config = 2;  // per-device config block (JSON types preserved; see PollRequest.config)
+}
+
+// ListenResponse is one lifecycle/health signal on the Listen server-stream (see the
+// Listen [DESIGN-CHECK] on whether this return channel should exist at all).
+// It is NOT an inbound device payload - received payloads go to the host via the
+// EventSinkService broker path, never back up this stream.
+message ListenResponse {
+  oneof item {
+    ListenStarted started = 1;
+    ListenHealth health = 2;
+  }
+}
+
+// ListenStarted is emitted once after the receiver has bound its port /
+// subscribed its topics / opened its watcher, reporting how many devices were
+// wired (a zero-bind situation is short-circuited host-side before Listen, so
+// this is informational).
+message ListenStarted {
+  int32 devices_bound = 1;
+}
+
+// ListenHealth is an optional periodic or edge-triggered health signal (a broker
+// reconnect storm, an unmapped-source-IP drop count) - the same conditions the
+// host routes to its notification path; surfaced here only if they are wanted on
+// the control stream (see Listen [DESIGN-CHECK]).
+message ListenHealth {
+  bool healthy = 1;
+  string detail = 2;
+}
+
+// ===========================================================================
+// CONSUME-SIDE (plugin -> host) BROKER SERVICES
+//
+// These are HOST-SERVED. The plugin DIALS BACK into them over the go-plugin
+// broker (PROTOCOL.md section 4); the host answers from its own DB session under
+// the request's tenant context. The plugin holds no DB handle and no schema, and
+// every call takes typed keys or typed facts rather than a query. A poller is
+// the typical consumer of all four; a listener typically uses EventSinkService (with
+// DecoderResolverService) and, for a directory watcher, ConfigService for routing.
+// ===========================================================================
+
+// CheckpointService is the host-served checkpoint store. The checkpoint is keyed
+// (device_type, device_id, method), and the HOST - not the plugin - applies the
+// advancement policy: it caps a future last_event_timestamp and resets the
+// consecutive-error and silent-cycle counters. A method that could set those
+// directly could hide its own failures by advancing past them.
+service CheckpointService {
+  // LoadCheckpoint returns the checkpoint for (method, device_type, device_id),
+  // or has_checkpoint=false when none exists yet (first poll).
+  rpc LoadCheckpoint(LoadCheckpointRequest) returns (LoadCheckpointResponse);
+
+  // SaveCheckpoint creates/updates the checkpoint after a successful ingest
+  // cycle. The host future-caps last_event_timestamp at server_now + tolerance
+  // and resets consecutive_errors + consecutive_silent_cycles. Counter fields
+  // are ADDITIVE - added to the running total, not overwriting it - so two
+  // cycles cannot silently clobber each other's totals.
+  rpc SaveCheckpoint(SaveCheckpointRequest) returns (SaveCheckpointResponse);
+
+  // RecordError records a poll error WITHOUT advancing the checkpoint
+  // (increments consecutive_errors, sets last_error / last_error_time). Keeping
+  // this separate from SaveCheckpoint is what stops a failed cycle from
+  // advancing past the data it failed on.
+  rpc RecordError(RecordErrorRequest) returns (RecordErrorResponse);
+}
+
+message LoadCheckpointRequest {
+  string method_name = 1;
+  DeviceType device_type = 2;
+  string device_id = 3;
+}
+
+message LoadCheckpointResponse {
+  bool has_checkpoint = 1;  // false on first poll
+  Checkpoint checkpoint = 2;
+}
+
+// Checkpoint is the wire form of the fields a method reads back.
+// Genuinely-optional instants rely on Timestamp message-presence: unset means
+// absent, which is distinct from a zero instant. Only the method-relevant read
+// fields are carried; host-internal bookkeeping is NOT echoed back to the
+// untrusted plugin, which has no need for it.
+message Checkpoint {
+  // File-based checkpoint (FTP/SFTP): file identity only - never event time.
+  string last_filename = 1;
+  google.protobuf.Timestamp last_file_mtime = 2;
+  string files_hash = 3;
+
+  // Event-based checkpoint (HTTP incremental `since`).
+  google.protobuf.Timestamp last_event_timestamp = 4;
+
+  // Used by backward-poison gating and silent-cycle math.
+  google.protobuf.Timestamp last_successful_poll = 5;
+}
+
+message SaveCheckpointRequest {
+  string method_name = 1;
+  DeviceType device_type = 2;
+  string device_id = 3;
+
+  // Update fields. Presence = "set this column"; absence = "leave unchanged" -
+  // the distinction matters because clearing a field and not mentioning it are
+  // different intents. The set-or-unchanged scalars use proto3 `optional` for
+  // explicit presence; the datetimes already carry presence as messages. The
+  // host future-caps last_event_timestamp.
+  google.protobuf.Timestamp last_event_timestamp = 4;
+  optional string last_filename = 5;
+  google.protobuf.Timestamp last_file_mtime = 6;
+  optional string files_hash = 7;
+
+  // Additive counters, ADDED to the running totals. These need no presence
+  // flag: 0 is a valid no-op (adds nothing), so a plain int64 is exact.
+  int64 events_ingested = 8;
+  int64 duplicates_absorbed = 9;
+  int64 files_ingested = 10;
+}
+
+message SaveCheckpointResponse {}
+
+message RecordErrorRequest {
+  string method_name = 1;
+  DeviceType device_type = 2;
+  string device_id = 3;
+  string error_msg = 4;  // host truncates; a plugin cannot fill the record
+}
+
+message RecordErrorResponse {}
+
+// EventSinkService is the host-served persistence path. The method NEVER writes the DB
+// and NEVER decodes; it forwards RAW received/fetched bytes and the host decodes,
+// validates and persists through its CORE integrity spine.
+//
+// The untrusted method contract exposes ONLY the raw-bytes path
+// (DecodeAndPersist). There is no decoded-events-in RPC: that path is
+// host-internal and is deliberately absent from this surface. This is the
+// integrity guardrail realized on the wire - a method that could hand over
+// finished events would have performed decode and validation itself, and the
+// host's spine would never run on that data. The method's job ends at delivering
+// the bytes it fetched.
+service EventSinkService {
+  // DecodeAndPersist hands the host RAW received bytes plus the decoder name and
+  // device id; the HOST resolves the decoder, decodes, runs the integrity spine,
+  // and persists (idempotent ON CONFLICT DO NOTHING). CLIENT-STREAMING: the
+  // payload is sent as a header frame (device id + decoder + scope) then bounded
+  // byte chunks, so a large fetched file never approaches the gRPC cap
+  // (PROTOCOL.md "Message size invariant"; decoder.proto DecodeRequest precedent).
+  // The host selects drift-check versus bare persist internally; the untrusted
+  // method does not choose persistence semantics.
+  rpc DecodeAndPersist(stream DecodeAndPersistRequest) returns (DecodeAndPersistResponse);
+}
+
+// DecodeAndPersistRequest frames: FIRST frame MUST be `header`, every subsequent
+// frame MUST be `chunk` (a bounded, in-order slice of the raw payload). Chunks
+// are transport-level byte slices, not semantic boundaries.
+message DecodeAndPersistRequest {
+  oneof frame {
+    DecodeAndPersistHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+message DecodeAndPersistHeader {
+  string device_id = 1;
+  string decoder_name = 2;     // explicit decoder to resolve host-side
+  DeviceType device_type = 3;  // target scope (see DeviceType)
+  // Label identifying the payload's origin, used by the host's drift-check
+  // notifications so an alert names what was being ingested.
+  string source_label = 4;
+
+  // Name of the payload's source when the method has one - a filename for a
+  // file-pull method, empty for a stream. The host records it on any review row
+  // it writes, so an operator's worklist names the artifact rather than the
+  // decoder that failed on it.
+  string filename = 5;
+
+  // Server wall-clock time of this device's last successful poll, when the
+  // method holds a checkpoint. The host compares it against the newest decoded
+  // event to catch a device whose clock has jumped backwards. Absent, that check
+  // cannot run and the batch is accepted unchecked, so a method that holds a
+  // checkpoint sends it.
+  google.protobuf.Timestamp last_successful_poll = 6;
+}
+
+// DecodeAndPersistResponse reports how many NEW rows were inserted, after the host's
+// idempotent insert has discarded rows it already had. The host computes
+// duplicates_absorbed itself (attempted minus inserted); the untrusted method
+// does not assert a duplicate count it could get wrong or falsify.
+message DecodeAndPersistResponse {
+  int64 events_inserted = 1;
+
+  // Terminal outcome of decode + integrity spine + persist (see IngestOutcome).
+  // The untrusted method does not choose whether the checkpoint advances.
+  IngestOutcome outcome = 2;
+
+  // Latest event timestamp actually persisted. The advance-to-last-good target
+  // on PARTIAL. Unset when events_inserted is 0.
+  google.protobuf.Timestamp max_event_time = 3;
+}
+
+// DecoderResolverService lets a method ASK the host which decoder applies (by explicit
+// name or by filename extension) WITHOUT the method decoding. It returns the
+// resolved decoder's registry NAME, never a decoder handle - the method does not
+// decode; it forwards the name on the EventSinkService path so the HOST decodes.
+//
+// [DESIGN-CHECK: is DecoderResolverService needed on the UNTRUSTED method contract at
+// all? EventSinkService.DecodeAndPersist already takes an explicit decoder_name and a
+// filename, and the host can resolve by extension itself. If so, the method
+// never needs to resolve anything - it forwards a possibly-empty decoder name
+// and a filename, and the host resolves. Open: whether this service is required,
+// or whether decoder resolution collapses entirely into EventSinkService's host-side
+// decode. Do not pick.]
+service DecoderResolverService {
+  // ResolveByName confirms an explicit decoder name is registered. An unknown
+  // name fails NOT_FOUND rather than returning an empty result.
+  rpc ResolveByName(ResolveByNameRequest) returns (ResolveByNameResponse);
+
+  // ResolveByExtension resolves a decoder from a filename's extension, with an
+  // optional explicit override; the override wins when both are present.
+  rpc ResolveByExtension(ResolveByExtensionRequest) returns (ResolveByExtensionResponse);
+}
+
+message ResolveByNameRequest {
+  string decoder_name = 1;
+}
+
+message ResolveByExtensionRequest {
+  string filename = 1;
+  string explicit_decoder = 2;  // empty -> derive from extension
+}
+
+// One response type per RPC, rather than a shared one: a change to how
+// extension resolution answers must not be forced on name resolution, or vice
+// versa. They carry the same field today and are still separate types.
+message ResolveByNameResponse {
+  // The registry name of the resolved decoder (e.g. "asc3"). The method forwards
+  // this on the EventSinkService path; it does NOT receive a decoder it can run.
+  string decoder_name = 1;
+}
+
+message ResolveByExtensionResponse {
+  // As ResolveByNameResponse: the resolved decoder's registry name only.
+  string decoder_name = 1;
+}
+
+// ConfigService is the host-served device-routing + identity-reference lookup.
+// It is how an untrusted method learns WHICH devices it serves and the
+// identity/config references the host's integrity checks compare against -
+// without the method touching the DB or the host's device tables. It returns
+// (device_id, decrypted-config) pairs filtered by the method that serves them,
+// and by instance where a method is instance-aware.
+//
+// Device IDENTITY lookups are deliberately absent. Checks that compare a
+// device's reported identity or configuration against what the host has on
+// record - controller replacement, configured phases, temporal integrity - are
+// CORE: the host runs them and writes provenance and review rows itself during
+// decode/validate/persist (PROTOCOL.md section 6 "Validation is core"). Exposing
+// those references to an untrusted method would hand it the answers to the very
+// checks being run against its data.
+//
+// [DESIGN-CHECK: ConfigService scope. The host already resolves the device set
+// BEFORE invoking the plugin, and hands it over in PollRequest/ListenRequest, so
+// a method may never need to call ListDevicesForMethod at all - which would make
+// ConfigService empty for pollers and only marginally useful to a directory
+// watcher, whose filename-to-device routing it can do from the supplied
+// DevicePair list. Open: whether ConfigService is needed on the method contract
+// at all, or whether device routing is fully satisfied by the host-supplied
+// DevicePair set. Do not pick.]
+service ConfigService {
+  // ListDevicesForMethod returns the (device_id, per-device-config) pairs
+  // eligible for this method; the host decrypts credentials before returning.
+  // SERVER-STREAMING one DevicePair per message so listing a large fleet never
+  // approaches the gRPC cap (PROTOCOL.md "Message size invariant").
+  rpc ListDevicesForMethod(ListDevicesForMethodRequest) returns (stream ListDevicesForMethodResponse);
+}
+
+// One streamed entry of the device listing. DevicePair is also a field type in
+// ListenRequest, so the response is a distinct wrapper: the RPC can gain a field
+// (a cursor, a total) without changing the shape embedded in ListenRequest.
+message ListDevicesForMethodResponse {
+  DevicePair device = 1;
+}
+
+message ListDevicesForMethodRequest {
+  string method_name = 1;
+  DeviceType device_type = 2;  // which device scope to query (see DeviceType)
+  // Instance discriminator for instance-aware methods, where several receivers
+  // of the same method serve disjoint device sets; empty -> "default".
+  string instance = 3;
+}

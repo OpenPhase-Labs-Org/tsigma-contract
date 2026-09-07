@@ -1,0 +1,162 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Decoder subsystem (exemplar).
+//
+// Trust posture: UNTRUSTED-VENDOR-OK. A decoder is a pure transform
+// (bytes -> events, plus optional file-level provenance). It receives no DB
+// credentials and uses no consume-side broker services; the host orchestrates
+// fetch -> decode -> validate -> persist and owns the integrity spine. This
+// contract stays separate even inside a combined vendor binary that also serves
+// the method contract (one binary, multiple registrations; the host still
+// orchestrates - never a merged poll-and-decode).
+//
+// Message-size invariant (see PROTOCOL.md "Message size invariant"):
+//   No message approaches the gRPC max; the limit is never raised. A decoder
+//   must run on UPLOADED FILES (an ASC/3 .dat or a multi-day log easily exceeds
+//   the cap), so Decode is BIDIRECTIONAL STREAMING: the host client-streams
+//   bounded byte chunks in, the decoder server-streams Arrow record batches out.
+//   This also keeps neither side buffering a whole file in memory. CanDecode
+//   sniffs only a bounded head, never the whole payload.
+//
+// Time semantics are a STATIC property of the decoder (a vendor format emits
+// UTC or controller-local by its nature), declared once at Describe - not a
+// per-batch flag a vendor can forget. The host resolves the signal's zone and
+// converts NAIVE_LOCAL instants to UTC at ingest; the decoder never converts
+// because it does not know the signal's zone.
+//
+// Wire types (see TYPES.md):
+//   - decoded events  -> Apache Arrow record batches, server-streamed
+//   - file metadata   -> protobuf (structured/small), streamed once
+//   - describe/health -> protobuf
+
+syntax = "proto3";
+
+package tsigma.decoder.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/decoder/v1;decoderv1";
+
+// DecoderService is implemented by a decoder (or sensor-decoder) plugin and called by
+// the host. All RPCs are host -> plugin (implement-side); a decoder uses no
+// consume-side broker services.
+service DecoderService {
+  // Describe returns the decoder's identity and static emission properties.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // CanDecode content-sniffs a BOUNDED HEAD of a payload (the host sends a
+  // prefix, not the whole file - see CanDecodeRequest). Used by the host's
+  // decoder resolver across the installed decoder plugins. Resolution is host
+  // logic, not a decoder plugin; the host SHOULD resolve by extension first
+  // (Describe.extensions) and content-sniff only to disambiguate.
+  rpc CanDecode(CanDecodeRequest) returns (CanDecodeResponse);
+
+  // Decode transforms raw bytes into a decoded event stream. The host
+  // client-streams the payload as bounded chunks; the decoder server-streams
+  // Arrow record batches, plus at most one FileMetadata for formats that carry
+  // a header.
+  rpc Decode(stream DecodeRequest) returns (stream DecodeResponse);
+}
+
+// TimeSemantics is how a decoder's event timestamps are anchored. Static per
+// decoder; carried on the wire as the Arrow schema-metadata key
+// "tsigma.time_semantics" = "utc" | "naive_local" (see TYPES.md).
+enum TimeSemantics {
+  TIME_SEMANTICS_UNSPECIFIED = 0;
+  TIME_SEMANTICS_UTC = 1;          // absolute UTC (e.g. SEPAC, OpenPhase, epoch-based)
+  TIME_SEMANTICS_NAIVE_LOCAL = 2;  // controller-local instant; host converts at ingest
+}
+
+// OutputKind tells the host which canonical Arrow schema the decoder emits, so
+// the host persister can dispatch on output type (controller_event_log vs
+// roadside_event) without a per-plugin target parameter.
+enum OutputKind {
+  OUTPUT_KIND_UNSPECIFIED = 0;
+  OUTPUT_KIND_EVENTS = 1;             // DecodedEvent batch -> controller_event_log
+  OUTPUT_KIND_SENSOR_DETECTIONS = 2;  // SensorDetection batch -> roadside_event
+}
+
+// DecodeOutcome is the terminal verdict on a decode. Without it the host cannot
+// tell a completed stream from one that stopped early, so a truncated file
+// silently looks like a short-but-successful decode.
+enum DecodeOutcome {
+  DECODE_OUTCOME_UNSPECIFIED = 0;
+  DECODE_OUTCOME_SUCCESS = 1;  // whole payload decoded; host persists all batches
+  DECODE_OUTCOME_PARTIAL = 2;  // decoded then hit undecodable input; host persists
+                               // what arrived and flags the remainder
+  DECODE_OUTCOME_FAILURE = 3;  // nothing usable; host persists nothing and surfaces
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;                 // registry key, e.g. "asc3"
+  repeated string extensions = 2;  // lower-case, leading dot, e.g. ".dat"
+  string description = 3;
+  OutputKind output_kind = 4;
+  TimeSemantics time_semantics = 5;
+}
+
+// CanDecodeRequest carries a BOUNDED HEAD of the payload - the leading bytes the
+// host has read (sufficient for magic-byte / header sniffing), not the whole
+// file. The decoder must decide from the head alone.
+message CanDecodeRequest {
+  bytes head = 1;
+}
+
+message CanDecodeResponse {
+  bool can_decode = 1;
+}
+
+// DecodeRequest is one bounded slice of the input payload, in order. Chunks are
+// transport-level (byte) slices, not semantic boundaries; the decoder
+// reassembles / stream-parses. Each chunk stays well under the gRPC cap.
+message DecodeRequest {
+  bytes chunk = 1;
+}
+
+// DecodeResponse is one item in the output stream: either the (at most one)
+// file-level provenance message, or one Arrow record batch of events. A decoder
+// typically emits metadata first (once the header is parsed), then batches.
+message DecodeResponse {
+  oneof payload {
+    // File-level provenance, sent at most once. Absent entirely for formats
+    // that carry no header; absence means the format has none, not that the
+    // decoder failed to produce it.
+    FileMetadata metadata = 1;
+
+    // One Apache Arrow record batch. The Arrow schema is the canonical
+    // DecodedEvent or SensorDetection schema per the decoder's OutputKind, and
+    // carries the "tsigma.time_semantics" schema-metadata key (see TYPES.md).
+    bytes events_arrow_ipc = 2;
+
+    // Terminal status, sent EXACTLY ONCE as the LAST message of the stream. A
+    // stream that ends without it is treated as FAILURE - absence is not success.
+    DecodeStatus status = 3;
+  }
+}
+
+// DecodeStatus closes the output stream with the decode's verdict.
+message DecodeStatus {
+  DecodeOutcome outcome = 1;
+  int64 events_emitted = 2;    // rows across every batch sent
+  string error = 3;            // human-readable; empty on SUCCESS
+  int64 segments_dropped = 4;  // undecodable segments skipped; 0 unless PARTIAL
+}
+
+// FileMetadata crosses the plugin boundary, so it is part of the contract, not
+// an implementation detail of either side. Genuinely-optional datetimes rely on
+// Timestamp message-presence: an unset field means the header did not carry the
+// value, which is distinct from a zero instant.
+message FileMetadata {
+  string device_ip = 1;
+  string device_mac = 2;
+  string log_version = 3;
+  string source_filename = 4;
+  repeated int32 phases_in_use = 5;
+  google.protobuf.Timestamp log_begin = 6;
+  google.protobuf.Timestamp header_anchor = 7;
+  google.protobuf.Timestamp header_anchor_secondary = 8;
+  map<string, string> raw = 9;
+}

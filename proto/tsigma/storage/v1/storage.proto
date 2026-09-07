@@ -1,0 +1,243 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Storage subsystem.
+//
+// Trust posture: PRIVILEGED - FIRST-PARTY OR DOT-SANCTIONED ONLY.
+// Storage is one of the two trust ROOTS that broker mediation cannot contain
+// (the other is auth). Unlike an untrusted-vendor subsystem - which is crash-
+// isolated, given no credentials, and handed only tenant-scoped data through
+// host broker services - a storage backend IS the data layer: it physically
+// holds the bytes the host persists (cold-tier Parquet, raw device-file
+// archives, report exports, any blob-oriented I/O). A malicious storage
+// backend is exfiltration / silent integrity loss, not a contained compute
+// fault. There is no mediation that makes an arbitrary storage binary safe,
+// so the host MUST gate registration: a binary cannot register as `storage`
+// unless it clears an explicit operator authorization keyed to this subsystem.
+// The ENFORCEMENT MECHANISM (signed plugins / operator allowlist / per-binary
+// approval, and which trust anchor applies for which operator type) is an OPEN
+// host-policy decision and is NOT designed here - see PROTOCOL.md section 6
+// "[DESIGN-CHECK] Privileged-tier enforcement mechanism". This file defines the
+// contract SHAPE only; it neither designs nor references a gate mechanism.
+//
+// WHAT THE STORAGE PLUGIN IS (and is NOT):
+//   The pluggable storage subsystem is the BLOB / OBJECT-STORE backend: a flat
+//   key -> bytes store with put / get / delete / exists / list / url. A
+//   filesystem backend and an S3 backend are the expected first-party pair;
+//   azure/gcs/etc. are additional backends behind this same contract. It is an
+//   OPAQUE blob store: keys map to file bytes, not to rows.
+//
+//   It is NOT the host's database access layer, which is core and carries no
+//   contract here. It is NOT the cold-tier query engine either: tier routing,
+//   the Parquet read path and spanning-window split/merge are core host
+//   pipeline that CALLS the active storage backend to physically read and write
+//   objects, but are never themselves a plugin. The tabular/row world (Arrow
+//   record batches, the canonical event schema) lives on the core side of that
+//   call, not in this contract.
+//
+// WIRE TYPES (see TYPES.md, PROTOCOL.md "Message size invariant"):
+//   This subsystem moves OPAQUE BLOB BYTES, not tabular rows - so it carries NO
+//   Apache Arrow. (TYPES.md maps Arrow to bulk/TABULAR payloads - decoded event
+//   batches, dataset rows, report row sets. A stored object is a file, not a row
+//   set; the host that writes it already serialized whatever it is - e.g. a
+//   Parquet file - before handing it to storage.) Bulk blob bytes still must
+//   never approach the gRPC cap, so:
+//     - Put  is CLIENT-STREAMING: a Put*Request header frame, then bounded byte
+//            chunk frames; the plugin replies once with the stored object's
+//            metadata.
+//     - Get  is SERVER-STREAMING: a Get*Request, then bounded byte chunk frames
+//            out.
+//     - List is SERVER-STREAMING: one StoredFile message per entry, so an
+//            arbitrarily large prefix never buffers a whole listing.
+//   Small/structured RPCs (Delete, Exists, Url, Describe, Health) are unary
+//   protobuf.
+//
+// CONSUME-SIDE BROKER: none. A storage backend is a pure sink/source addressed
+// by key; it does not dial back to host broker services. (Contrast the decoder,
+// which also uses none, vs pollers/reports, which do.) The host orchestrates
+// what gets written and read; the backend only moves bytes for the key it is
+// given. The privileged gate - not broker mediation - is what governs trust
+// here, which is exactly why storage is a trust root rather than a contained
+// vendor binary.
+//
+// Per-subsystem versioning: v1, independently versioned from the other
+// subsystems (PROTOCOL.md section 5). Self-contained; depends only on
+// well-known protobuf types.
+
+syntax = "proto3";
+
+package tsigma.storage.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/storage/v1;storagev1";
+
+// StorageService is implemented by a storage-backend plugin and called by the host.
+// All RPCs are host -> plugin (implement-side). A storage backend uses no
+// consume-side broker services.
+//
+// The method set is the minimum a blob store must offer: put, get, delete,
+// exists, list, url. Put and Get are streamed to honor the message-size
+// invariant; the rest are unary.
+service StorageService {
+  // Describe returns the backend's identity and static properties. The host
+  // uses it at registration to record which backend, and which capabilities,
+  // is loaded. Every subsystem in this contract opens with a Describe
+  // handshake; storage is not exempt.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Put stores an object at a key. CLIENT-STREAMING: the host sends exactly one
+  // PutRequest whose first frame is the header (key + metadata + content_type)
+  // and whose subsequent frames are bounded byte chunks of the object body. The
+  // plugin returns the stored object's metadata once the stream completes.
+  rpc Put(stream PutRequest) returns (PutResponse);
+
+  // Get returns the object bytes at a key. SERVER-STREAMING: the plugin streams
+  // bounded byte chunks of the object body. If the key does not exist the RPC
+  // fails with NOT_FOUND; a missing object is a status code, never an empty
+  // stream the caller might read as an empty file.
+  rpc Get(GetRequest) returns (stream GetResponse);
+
+  // Delete removes a key. It is a NO-OP (returns OK) if the key does not exist:
+  // delete is idempotent so a retried cleanup does not fail on its second pass.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Exists reports whether a key exists. Never an error for a missing key -
+  // returns exists=false.
+  rpc Exists(ExistsRequest) returns (ExistsResponse);
+
+  // List streams every stored object under a prefix, one StoredFile per
+  // message. SERVER-STREAMING so a large prefix never buffers a whole listing.
+  rpc List(ListRequest) returns (stream ListResponse);
+
+  // Url returns a URL for a key. A filesystem-style backend returns a static
+  // file:// URI; an object-store backend returns a presigned GET URL valid for
+  // expires_in. DescribeResponse.supports_presigned_url tells the host which
+  // behavior to expect.
+  rpc Url(UrlRequest) returns (UrlResponse);
+}
+
+// StoredFile is object metadata, returned by Put and streamed by List.
+message StoredFile {
+  string key = 1;
+  int64 size = 2;  // object size in bytes
+  google.protobuf.Timestamp last_modified = 3;
+  map<string, string> metadata = 4;
+  // Empty means unknown, and the host applies the "application/octet-stream"
+  // default. The wire may carry "" - a backend is not required to sniff a type
+  // it was never told.
+  string content_type = 5;
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  // name is the backend's registry key, e.g. "filesystem" or "s3". The host
+  // selects the active backend by this key through its own configuration.
+  string name = 1;
+  string description = 2;
+
+  // supports_presigned_url is true when Url returns a time-limited presigned
+  // URL whose expires_in is honored (S3-style); false when Url returns a static
+  // locator that ignores expires_in (filesystem file:// URI).
+  bool supports_presigned_url = 3;
+
+  // [DESIGN-CHECK: Describe shape. The fields here are the minimum a host needs
+  // to select and use a backend: a registry key, and whether Url is presigned
+  // or static. Open: whether a host must know any further capability before
+  // registering a backend - maximum object size, metadata support, multipart
+  // upload. Do not expand speculatively; each flag added here is one every
+  // backend author must answer forever.]
+}
+
+// ---- Put (client-streaming) -------------------------------------------------
+
+// PutRequest is one frame of the client-stream. The FIRST frame MUST be `header`
+// (key + metadata + content_type); every subsequent frame MUST be `chunk` (a
+// bounded slice of the object body, in order). Splitting header from body lets
+// the body stream in bounded pieces so no single message approaches the gRPC
+// cap (PROTOCOL.md "Message size invariant"). Chunks are transport-level byte
+// slices, not semantic boundaries.
+message PutRequest {
+  oneof frame {
+    PutHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+message PutHeader {
+  string key = 1;
+  map<string, string> metadata = 2;
+  // Optional; empty means the host/backend default "application/octet-stream".
+  string content_type = 3;
+}
+
+// PutResponse is returned once, after the host closes the request stream. It
+// carries the stored object's metadata as the backend actually recorded it.
+message PutResponse {
+  StoredFile file = 1;
+}
+
+// ---- Get (server-streaming) -------------------------------------------------
+
+message GetRequest {
+  string key = 1;
+}
+
+// GetResponse is one bounded slice of the object body, in order. The decoder's
+// DecodeRequest is the precedent for opaque byte chunking on this contract. A
+// missing key is signaled by the RPC failing with NOT_FOUND, not by an empty
+// stream.
+message GetResponse {
+  bytes chunk = 1;
+}
+
+// ---- Delete / Exists / List / Url (unary, except List) ----------------------
+
+message DeleteRequest {
+  string key = 1;
+}
+
+// DeleteResponse is intentionally empty: Delete is a no-op on a missing key, so
+// there is nothing to report. (Kept as a message, not google.protobuf.Empty, so
+// fields can be added additively later without a breaking signature change.)
+message DeleteResponse {}
+
+message ExistsRequest {
+  string key = 1;
+}
+
+message ExistsResponse {
+  bool exists = 1;
+}
+
+// One streamed entry of the listing. StoredFile is also PutResponse's payload,
+// so the response is a distinct wrapper: List can gain a field (a continuation
+// token, a truncation flag) without changing what Put returns.
+message ListResponse {
+  StoredFile file = 1;
+}
+
+message ListRequest {
+  string prefix = 1;
+}
+
+message UrlRequest {
+  string key = 1;
+  // Requested lifetime of a presigned URL, in seconds. Backends that return a
+  // static locator ignore it. 0 means "use the backend default".
+  int64 expires_in_seconds = 2;
+
+  // [DESIGN-CHECK: Url for a missing key. The two backend families disagree by
+  // nature: a filesystem locator can be checked for existence cheaply, while
+  // presigning is a signature operation that does not consult the store at all
+  // and yields a URL for a key that was never written. Open: whether Url MUST
+  // fail NOT_FOUND for an absent key (uniform across backends, but costs the
+  // object-store backend an existence check per call) or MAY return a URL the
+  // caller will get a 404 from (native, but the failure surfaces later and
+  // somewhere else). Shape is unaffected either way.]
+}
+
+message UrlResponse {
+  string url = 1;
+}

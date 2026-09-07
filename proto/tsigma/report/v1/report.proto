@@ -1,0 +1,201 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Report subsystem.
+//
+// Trust posture: UNTRUSTED-VENDOR-OK. A report plugin computes an analytics
+// view over a signal + time-range. It receives NO database credentials and NO
+// schema.
+//
+// A report reads through the HOST'S OWN API, authenticated with a short-lived
+// credential the host mints for the invocation - as the user the report is
+// being run for - and revokes when the invocation ends. The credential travels
+// over the plugin connection; it is never placed in the plugin's argv or
+// environment. This subsystem therefore defines NO consume-side broker
+// services: a report composes no query that crosses the plugin boundary.
+//
+// The host API applies the deploying operator's access policy per data
+// category. Reading through it means a report is bounded by that policy for the
+// user it runs on behalf of, rather than by a second notion of tenant scope
+// maintained separately on a broker.
+//
+// Implement-side (host -> plugin): Describe returns identity + param schema +
+// export capabilities; Generate runs the report for validated params and
+// returns a STRUCTURED VIEW-MODEL (protobuf), optionally accompanied by
+// server-streamed Apache Arrow record batches for bulk row data.
+//
+// CRITICAL substrate tell (see TYPES.md "Report view-models"):
+//   A report NEVER returns a host-native table object on the wire.
+//   Small/structured result -> protobuf view-model. Bulk row data that
+//   accompanies a report -> Apache Arrow record batches, server-streamed
+//   (message-size invariant: a large result is a SEQUENCE of bounded batches,
+//   never one max-sized blob - see PROTOCOL.md "Message size invariant").
+//   Each host renders the view-model with its own UI layer and materializes the
+//   rows into whatever it uses natively; the Arrow buffer itself is what
+//   crosses, unconverted.
+//
+// Wire types (see TYPES.md):
+//   - report view-model     -> protobuf (structured/small)
+//   - report bulk rows      -> Apache Arrow record batches, server-streamed
+//   - describe/param-schema -> protobuf
+
+syntax = "proto3";
+
+package tsigma.report.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/report/v1;reportv1";
+
+// ===========================================================================
+// Implement-side: host -> plugin. The host calls these on the report plugin.
+// ===========================================================================
+
+// ReportService is implemented by a report plugin and called by the host.
+service ReportService {
+  // Describe returns the report's identity, category/timing hints, export
+  // capabilities, and its parameter schema. The host publishes this on its
+  // reports API and uses the param schema to validate required keys before
+  // Generate, rejecting a missing required field rather than invoking the
+  // plugin with an incomplete parameter set.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Generate runs the report for the given params and returns a structured
+  // view-model, optionally followed by Arrow record batches of bulk rows.
+  // The result is server-streamed so that a large row set is delivered as a
+  // sequence of bounded Arrow batches (never one max-sized message). During
+  // Generate the plugin reads through the host API using the short-lived
+  // credential minted for this invocation; it makes no broker calls.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+}
+
+// ReportCategory is the report's cost class, declared at Describe so a host can
+// route and schedule it without running it first.
+enum ReportCategory {
+  REPORT_CATEGORY_UNSPECIFIED = 0;
+  REPORT_CATEGORY_DASHBOARD = 1;  // aggregates only, sub-100ms
+  REPORT_CATEGORY_STANDARD = 2;   // aggregates + light events, < 2s
+  REPORT_CATEGORY_DETAILED = 3;   // heavy event queries, async
+}
+
+// EstimatedTime is the report's own declaration of how long it expects to run,
+// used for scheduling and for choosing a synchronous or deferred invocation.
+enum EstimatedTime {
+  ESTIMATED_TIME_UNSPECIFIED = 0;
+  ESTIMATED_TIME_FAST = 1;
+  ESTIMATED_TIME_MEDIUM = 2;
+  ESTIMATED_TIME_SLOW = 3;
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;                      // registry key, e.g. "approach-delay"
+  string description = 2;
+  ReportCategory category = 3;
+  EstimatedTime estimated_time = 4;
+  bool supports_export = 5;
+  repeated string export_formats = 6;   // default ["csv","json"]; e.g. add "ndjson"
+
+  // Parameter schema for this report, which the host publishes on its reports
+  // API and validates required keys against before Generate. Tunable defaults
+  // declared here feed the host's default resolution: per-request value, then
+  // operator-configured default, then the plugin's own default.
+  repeated ParamField params = 7;
+}
+
+// ParamField describes one report parameter. The plugin owns its typed params
+// representation internally and validates fully on its own side; this is only
+// the host-facing description used to publish the schema and to reject a
+// request missing a required field.
+message ParamField {
+  string name = 1;            // e.g. "signal_id", "start", "phase_number"
+  ParamType type = 2;
+  bool required = 3;
+  string description = 4;
+  // Optional admin-configurable default (measure-defaults). Absent =>
+  // code-level default inside the plugin. google.protobuf.Value carries the
+  // default in its natural JSON type.
+  google.protobuf.Value default = 5;
+  // For enumerated params (e.g. bin_size in {"15min","hour","day"}).
+  repeated string enum_values = 6;
+}
+
+enum ParamType {
+  PARAM_TYPE_UNSPECIFIED = 0;
+  PARAM_TYPE_STRING = 1;
+  PARAM_TYPE_INT = 2;
+  PARAM_TYPE_FLOAT = 3;
+  PARAM_TYPE_BOOL = 4;
+  PARAM_TYPE_DATETIME = 5;  // ISO-8601 string on the wire; host/plugin parse to instant
+}
+
+message GenerateRequest {
+  // Validated params as a JSON-shaped struct. The host has already checked
+  // required keys against DescribeResponse.params; the plugin decodes this
+  // into its own typed representation and runs full validation. Crossing params
+  // as a Struct rather than a host-native object is what keeps the boundary
+  // neutral: each side builds its own typed form from this.
+  google.protobuf.Struct params = 1;
+
+  // Requested export format, when this Generate is serving an export request
+  // ("csv" | "json" | "ndjson"). Empty => an interactive (non-export) run.
+  // The host does the actual serialization from the view-model + Arrow rows;
+  // this only lets a plugin reject a format it does not support.
+  string export_format = 2;
+}
+
+// GenerateResponse is one item in the output stream. A report emits exactly one
+// ViewModel header first (the structured result), then zero or more Arrow
+// record batches of bulk rows. A small/structured report (dashboard tile,
+// summary KPIs) emits only the ViewModel and no batches; a detailed report
+// (purdue-diagram cycles, raw exports) streams its rows as Arrow batches.
+//
+// The split is deliberate and minimal: tabular rows -> Arrow batches; a small
+// structured header -> ViewModel. A report's result is a table, so the header
+// carries only what a host needs to render one ({columns, empty, status}).
+// This MAY change later: if a host UI needs a richer view-model (chart axes,
+// series, summary-stat block), it is added additively to ViewModel then. A tag
+// can be added but never repurposed, so a field guessed now is carried forever.
+message GenerateResponse {
+  oneof payload {
+    // The structured result header, sent exactly once, first.
+    ViewModel view_model = 1;
+
+    // One Apache Arrow record batch of bulk result rows. The Arrow schema
+    // matches ViewModel.columns. Sent zero or more times after the
+    // ViewModel. Each batch stays well under the gRPC cap.
+    bytes rows_arrow_ipc = 2;
+  }
+}
+
+// ViewModel is the structured, host-renderable result of a report. It is the
+// protobuf view-model TYPES.md requires - never a host-native table object on
+// the wire. Bulk rows accompany it as Arrow batches (above); this message
+// carries the result's structure and the small/structured fields a host UI
+// needs to render or serialize without re-deriving them.
+message ViewModel {
+  // Ordered result column names; the accompanying Arrow batches carry these
+  // same columns with their typed schema. A report that produced no rows STILL
+  // declares its columns here, so a host can render an empty table with correct
+  // headers instead of having to guess the shape of a result it did not get.
+  repeated string columns = 1;
+
+  // True when the report produced zero rows. An empty result is a valid,
+  // successful result: the host emits a well-formed empty payload rather than
+  // treating it as a failure.
+  bool empty = 2;
+
+  // Optional override HTTP status for this SUCCESSFUL run. 0 => default (200).
+  // It exists for the gating report: one that completes correctly and whose
+  // answer is "this signal is not eligible for the downstream analysis". That
+  // is not a server error and not an empty result, and collapsing it into
+  // either would lose the distinction.
+  int32 preferred_http_status = 3;
+
+  // Minimal header only. No report-specific structured fields (chart axes,
+  // series descriptors, summary-stat blocks): those describe how a host renders
+  // a result rather than what the result is. If a host UI later needs more than
+  // {columns, empty, status}, it is added additively here.
+}
+

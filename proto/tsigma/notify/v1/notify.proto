@@ -1,0 +1,164 @@
+// Copyright (c) 2026 OpenPhase Labs, LLC
+// SPDX-License-Identifier: MPL-2.0
+
+// TSIGMA Contract - Notification subsystem.
+//
+// Trust posture: UNTRUSTED-VENDOR-OK. A notification provider is an output-only
+// sink (email, Slack, Teams, PagerDuty, ...). It receives no DB credentials and
+// uses no consume-side broker services; the host hands it a single, fully-formed,
+// already-rendered alert and the provider delivers it to an external channel.
+// The provider never reads host data, never resolves recipients from the host,
+// and never reaches back - it is the simplest of the wire subsystems.
+//
+// Best-effort, NEVER blocks ingest (design invariant): notification is
+// fire-and-forget. The host triggers it OFF the per-request hot path (watchdog,
+// alerts, background ingest work), fans out to every active provider, and
+// CATCHES and LOGS every provider error. A Send failure is therefore
+// ADVISORY ONLY: the host
+// records it and moves on; it never fails the host operation that produced the
+// alert, and it never returns to the alert's caller. Send below returns a status
+// for the host to LOG, not to act on - a non-OK Send must never be allowed to
+// abort ingest or any other host work.
+//
+// IMPLEMENT-SIDE ONLY. All RPCs are host -> plugin. There is NO consume-side
+// broker callback in this subsystem, by design:
+//   - The alert payload is fully self-contained: subject, message, severity,
+//     and a structured metadata block. The provider needs nothing from the host
+//     to deliver it.
+//   - Recipient/channel config (SMTP host, webhook URL, ...) is provider-owned,
+//     supplied once at Initialize from provider-scoped settings - NOT resolved
+//     per-send from a host broker service. The provider does not call back to
+//     ask "who should receive this"; that is host/operator configuration the
+//     provider reads at init.
+//   - Alert SUPPRESSION is HOST-SIDE and upstream of this contract: the host
+//     applies its own suppression rules, keyed by signal and check, BEFORE
+//     invoking the provider. A suppressed alert is simply never sent. The
+//     provider therefore has no suppression hook and no suppression-query
+//     broker callback - it must not re-implement or be consulted for it.
+// Because nothing is needed back from the host, this subsystem defines no
+// GRPCBroker services (PROTOCOL.md section 4: broker services are defined only
+// where a subsystem needs them; pure sinks use none).
+//
+// Wire types (see TYPES.md): notifications are small and structured -> protobuf
+// only. There is no bulk/tabular payload here, so NO Apache Arrow and no
+// streaming RPCs - every message is well under the gRPC cap.
+//
+// Severity is a STATIC, closed three-level ordinal (INFO < WARNING < CRITICAL),
+// modeled as an enum. Each provider also declares its own MinSeverity threshold
+// at Describe so the host can fan out / gate; on the wire the host still sends
+// the alert's severity on every Send (the host already applies the threshold,
+// but the provider receives the level for rendering, e.g. the "[CRITICAL]"
+// subject tag / color).
+
+syntax = "proto3";
+
+package tsigma.notify.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/OpenPhase-Labs/tsigma-contract/gen/go/tsigma/notify/v1;notifyv1";
+
+// NotifyService is implemented by a notification-provider plugin and called by the
+// host. All RPCs are host -> plugin (implement-side); a provider uses no
+// consume-side broker services.
+service NotifyService {
+  // Describe returns the provider's identity and static delivery properties
+  // (its registry key and the minimum severity it accepts). The host uses
+  // MinSeverity to fan out: notifications below this level are never sent to
+  // this provider. Both are static properties of the provider, not per-send
+  // parameters.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+
+  // Initialize configures the provider from host-supplied, provider-scoped
+  // settings (SMTP host/port, webhook URL, recipients, ...) once after launch.
+  // A provider that cannot configure itself reports ok=false with a reason; the
+  // host then
+  // logs it and EXCLUDES the provider from the active set (non-fatal - the host
+  // continues without it). Initialize never makes the host fail.
+  rpc Initialize(InitializeRequest) returns (InitializeResponse);
+
+  // Send delivers ONE already-rendered notification to the provider's channel.
+  // Host -> plugin, unary, fire-and-forget from the host's perspective: the
+  // returned SendResponse is ADVISORY (the host LOGS a non-OK result and never
+  // propagates it). Send must never block ingest.
+  rpc Send(SendRequest) returns (SendResponse);
+}
+
+// Severity is the closed, ordinal alert level. INFO < WARNING < CRITICAL.
+// The host is the authority on ordering and gating. An UNSPECIFIED severity is
+// a contract violation the host FLAGS rather than coerces: silently treating an
+// unknown level as the lowest would let a provider or a wiring bug downgrade a
+// CRITICAL alert into one nobody is paged for.
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_WARNING = 2;
+  SEVERITY_CRITICAL = 3;
+}
+
+message DescribeRequest {}
+
+message DescribeResponse {
+  string name = 1;               // registry key, e.g. "email", "slack", "teams"
+  string description = 2;
+  // Minimum severity this provider accepts; the host skips Send for any alert
+  // below it. Defaults to WARNING when the provider declares nothing.
+  Severity min_severity = 3;
+}
+
+// InitializeRequest carries the provider-scoped configuration the host resolves
+// from its settings for THIS provider. The host passes only this provider's
+// keys; the plugin never receives unrelated settings, and never DB credentials.
+//
+// [DESIGN-CHECK: per-provider config key set is open.] A host cannot pass a
+// native settings object across the plugin boundary, and a vendor's provider may
+// need arbitrary keys the host's own settings do not model. Two shapes are
+// possible and NOT decided here:
+//   (a) a flat string map of the env-style keys this provider declares it needs
+//       (modeled below as `config`), or
+//   (b) the provider declaring its required keys at Describe and the host
+//       passing exactly those.
+// The flat map (a) is modeled below as the smaller commitment; adopting (b)
+// adds a `required_config_keys` field to DescribeResponse and leaves this
+// message unchanged. Either way: values are strings (env-var shaped); secrets
+// (SMTP password, webhook URL) flow here, so the transport's confidentiality is
+// the host's responsibility, not a field concern.
+message InitializeRequest {
+  map<string, string> config = 1;
+}
+
+message InitializeResponse {
+  bool ok = 1;       // false -> host logs `reason` and drops this provider (non-fatal)
+  string reason = 2; // human-readable cause when ok=false; empty when ok=true
+}
+
+// SendRequest is ONE fully-formed, already-rendered notification. The host does
+// all rendering and gating upstream; the provider only delivers.
+message SendRequest {
+  // Short summary - email subject / Slack header.
+  string subject = 1;
+
+  // Full plain-text body.
+  string message = 2;
+
+  // Severity of THIS alert. The host has already applied MinSeverity gating; the
+  // provider receives the level for rendering (tag, color).
+  Severity severity = 3;
+
+  // Optional structured, alert-type-specific data, absent for alerts that carry
+  // none. Struct rather than a string map because the values are heterogeneous
+  // and sometimes nested - a drift measurement is a float, a count is an
+  // integer, an affected-signal set is a list - and flattening them to strings
+  // would force every provider to re-parse. Struct is the contract-wide standard
+  // for an arbitrary JSON block (as in method config and report params): a
+  // provider that renders metadata as text stringifies it, and one that needs
+  // typed or nested data gets it intact.
+  google.protobuf.Struct metadata = 4;
+}
+
+// SendResponse is ADVISORY. A non-OK result is something the host LOGS; it is
+// NEVER propagated to the alert's caller and NEVER fails ingest or any host work.
+message SendResponse {
+  bool ok = 1;       // false -> delivery failed; host logs `error`, keeps going
+  string error = 2;  // human-readable failure cause when ok=false
+}
